@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "azure-token-login"
+version = "0.1.0"
+description = "Import short-lived Azure access tokens into Azure CLI authentication state"
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+include = ["azext_token_login*"]
