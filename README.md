@@ -28,14 +28,26 @@ config separately if restoring existing login state is especially important.
 
 ## Import and remove
 
-The import command takes **exactly two arguments**: `--access-token` and
-`--subscription-id`. Supply the token itself, not a filename or JSON wrapper:
+The import command requires `--access-token` and `--subscription-id`. Supply the
+JWT itself, not a filename or JSON wrapper:
 
 ```sh
 az token-login import --access-token "$ACCESS_TOKEN" --subscription-id "$SUBSCRIPTION_ID"
 az account set --subscription "$SUBSCRIPTION_ID"
 az group list --subscription "$SUBSCRIPTION_ID"
 ```
+
+To replace an unexpired imported token, pass `-f` (or `--force`):
+
+```sh
+az token-login import --access-token "$NEW_ACCESS_TOKEN" --subscription-id "$SUBSCRIPTION_ID" -f
+```
+
+An imported token whose `exp` is in the past is replaced automatically without
+`-f`. The **new** token must still have more than five minutes remaining because
+MSAL cannot use it near expiry. `-f` does not bypass token validation or checks
+that the old cached credential and profile are still owned by this extension.
+For older imports whose expiry cannot be confirmed from the cache, use `-f`.
 
 **Security warning:** the expanded token appears in the `az` process arguments.
 It can be visible to other local processes and may be recorded in shell history,
@@ -56,12 +68,22 @@ az token-login remove --subscription-id "$SUBSCRIPTION_ID"
 az token-login remove  # all imported subscriptions
 ```
 
+Removing an import restores its original account association if that association
+still belongs to the imported account. When restoring an earlier association,
+changes to descriptive subscription metadata (such as its name or state) are
+preserved. If another login has replaced the association, removal leaves that
+profile entry alone and cleans up only the original imported credential. A changed
+cached token or shared account still prevents removal to avoid deleting another
+login's credentials.
+
 The importer uses MSAL's cache lock and checks for intervening profile changes,
 but ordinary `az` profile writes do not honor its lock. **Do not run other `az`
-processes concurrently with import or removal.** The two files cannot be
-updated as one atomic transaction. If an operation is interrupted, retry
-`az token-login remove` to finish its recovery journal. It refuses to remove
-an entry another process has changed.
+processes concurrently with import, replacement, or removal.** The profile,
+cache, and recovery journal cannot be updated as one atomic transaction. An
+ordinary replacement failure attempts to restore the previous import. If the
+process is interrupted, run `az token-login remove` to finish its recovery
+journal; a previously removed access token cannot be recovered after an
+interrupted replacement. An incoming token can then be imported again.
 
 Only ARM-audience JWT access tokens containing tenant and expiry claims are
 supported. **A Microsoft Graph token is rejected** because its audience does not
@@ -72,8 +94,8 @@ would still not authenticate ARM commands. An access token cannot be exchanged
 for a different audience without another authentication flow. This extension
 does not create tokens for Graph, data-plane services, claims challenges, or
 other tenants. A cached account with a refresh token is not borrowed; a
-synthetic account is used instead. Remove a previous import before importing
-a newer token for the same subscription.
+synthetic account is used instead. Replace a recorded import with `-f`, or
+without it once the old access token has expired.
 
 Keep `token-login-state.json` private: it contains account metadata. Tests use
 fabricated tokens only:

@@ -8,6 +8,8 @@ def load_arguments(self, _):
                          help='ARM bearer token. WARNING: visible in shell history and process listings.')
         context.argument('subscription_id', options_list=['--subscription-id'], required=True,
                          help='Subscription ID to associate with this access token.')
+        context.argument('force', options_list=['-f', '--force'], action='store_true',
+                         help='Replace an existing imported access token even if it has not expired.')
 
     with self.argument_context('token-login remove') as context:
         context.argument('subscription_id', options_list=['--subscription-id'],

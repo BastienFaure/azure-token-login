@@ -28,6 +28,7 @@ class AzureCliIntegrationTests(unittest.TestCase):
             wheel_dir = base / 'wheel'
             wheel_dir.mkdir()
             fabricated_token = jwt()
+            replacement_token = jwt(oid=SUB)
             env = dict(os.environ, AZURE_CONFIG_DIR=str(config),
                        HTTP_PROXY='http://127.0.0.1:9', HTTPS_PROXY='http://127.0.0.1:9',
                        ALL_PROXY='http://127.0.0.1:9', NO_PROXY='',
@@ -49,6 +50,12 @@ class AzureCliIntegrationTests(unittest.TestCase):
                           '--subscription-id', SUB)
             self.assertEqual(imported.returncode, 0, imported.stderr)
             self.assertEqual(json.loads(imported.stdout)['importedSubscriptions'], 1)
+            duplicate = az('token-login', 'import', '--access-token', replacement_token,
+                           '--subscription-id', SUB)
+            self.assertNotEqual(duplicate.returncode, 0)
+            forced = az('token-login', 'import', '--access-token', replacement_token,
+                        '--subscription-id', SUB, '-f')
+            self.assertEqual(forced.returncode, 0, forced.stderr)
             account = az('account', 'show')
             self.assertEqual(account.returncode, 0, account.stderr)
             self.assertEqual(json.loads(account.stdout)['id'], SUB)
@@ -71,14 +78,18 @@ class AzureCliIntegrationTests(unittest.TestCase):
                 cache_key, NormalizedResponse(discovery_response), expires_in=3600)
             token_result = az('account', 'get-access-token', '--subscription', SUB)
             if token_result.returncode == 0:
-                self.assertEqual(json.loads(token_result.stdout)['accessToken'], fabricated_token)
+                self.assertEqual(json.loads(token_result.stdout)['accessToken'], replacement_token)
                 # A synthetic token cannot authorize an actual ARM request. Confirm
                 # a built-in SDK command reaches transport instead of asking to log in.
                 group_list = az('group', 'list', '--subscription', SUB)
                 self.assertNotEqual(group_list.returncode, 0)
                 self.assertIn('127.0.0.1', group_list.stderr)
                 self.assertNotIn(fabricated_token, group_list.stderr)
-            removed = az('token-login', 'remove')
+            profile_path = config / 'azureProfile.json'
+            profile = json.loads(profile_path.read_text(encoding='utf-8-sig'))
+            profile['subscriptions'][0]['name'] = 'Updated subscription name'
+            profile_path.write_text(json.dumps(profile))
+            removed = az('token-login', 'remove', '--subscription-id', SUB)
             self.assertEqual(removed.returncode, 0, removed.stderr)
             self.assertEqual(json.loads(removed.stdout)['removedSubscriptions'], 1)
             old_spelling = az('token-login', 'import', '--access--token', fabricated_token,

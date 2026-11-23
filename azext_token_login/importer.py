@@ -181,17 +181,22 @@ def _record(profile, sub_id, environment_name):
     return matches[0] if matches else None
 
 
+def _changed_metadata(current, imported):
+    return {k: copy.deepcopy(v) for k, v in current.items()
+            if k not in ('id', 'environmentName', 'tenantId', 'user', 'isDefault')
+            and (k not in imported or imported[k] != v)}
+
+
 def _restore_profile(profile, state_entries, selected):
     subscriptions = profile['subscriptions']
     removed_active_clouds = set()
     for sub_id in selected:
         entry = state_entries[sub_id]
         current = _record(profile, sub_id, entry['cloud'])
-        if not _imported_profile_matches(current, entry):
-            if not ((entry['pending'] or entry.get('removing'))
-                    and _profile_already_restored(current, entry)):
-                raise CLIError('An imported profile entry was changed; cannot safely restore it.')
-        else:
+        if ((entry['pending'] or entry.get('removing'))
+                and _profile_already_restored(current, entry)):
+            continue
+        if _imported_profile_matches(current, entry):
             default = current.get('isDefault', False)
             if default:
                 removed_active_clouds.add(entry['cloud'])
@@ -199,8 +204,11 @@ def _restore_profile(profile, state_entries, selected):
             previous = entry['previous_profile']
             if previous is not None:
                 previous = copy.deepcopy(previous)
+                previous.update(_changed_metadata(current, entry['imported_profile']))
                 previous['isDefault'] = bool(default and previous.get('isDefault'))
                 subscriptions.append(previous)
+        # An unrelated login may have replaced or removed this profile entry.
+        # Leave it alone while removing only our own hashed cache entry.
     for name in removed_active_clouds:
         cloud_subs = [s for s in subscriptions if s.get('environmentName') == name]
         if cloud_subs and not any(s.get('isDefault') for s in cloud_subs):
@@ -213,27 +221,29 @@ def _restore_profile(profile, state_entries, selected):
     return profile
 
 
-def _assert_removable(cache, profile, state_entries, selected):
+def _assert_removable(cache, profile, state_entries, selected, replacing=False):
     for sub_id in selected:
         entry = state_entries[sub_id]
         current = _record(profile, sub_id, entry['cloud'])
-        if not _imported_profile_matches(current, entry):
-            if not ((entry['pending'] or entry.get('removing'))
-                    and _profile_already_restored(current, entry)):
-                raise CLIError('An imported subscription was changed; refusing to overwrite it.')
-        tokens = _matching_at(cache, entry)
-        if len(tokens) > 1 or (tokens and hashlib.sha256(tokens[0]['secret'].encode()).hexdigest()
-                                   != entry['token_sha256']):
-            raise CLIError('A cached token was changed by another process; refusing to remove it.')
-        if entry['created_account']:
-            home = {'home_account_id': entry['home_account_id'],
-                    'environment': entry['environment']}
-            other_tokens = [at for at in cache.search(cache.CredentialType.ACCESS_TOKEN,
-                                                      query=home) if at not in tokens]
-            other_tokens += list(cache.search(cache.CredentialType.REFRESH_TOKEN, query=home))
-            other_tokens += list(cache.search(cache.CredentialType.ID_TOKEN, query=home))
-            if other_tokens:
-                raise CLIError('Another credential now uses the imported account; refusing to remove it.')
+        if replacing and not _imported_profile_matches(current, entry):
+            raise CLIError('The imported subscription is now associated with another login; '
+                           'remove its import before replacing it.')
+        with CrossPlatLock(cache._lock_location):  # pylint: disable=protected-access
+            snapshot = _load_cache_snapshot(cache)
+            key = snapshot.key_makers[snapshot.CredentialType.ACCESS_TOKEN](**entry)
+            token = snapshot._get(snapshot.CredentialType.ACCESS_TOKEN, key)  # pylint: disable=protected-access
+            if token and hashlib.sha256(token['secret'].encode()).hexdigest() != entry['token_sha256']:
+                raise CLIError('A cached token was changed by another process; refusing to remove it.')
+            if entry['created_account']:
+                for kind in (snapshot.CredentialType.ACCESS_TOKEN,
+                             snapshot.CredentialType.REFRESH_TOKEN,
+                             snapshot.CredentialType.ID_TOKEN):
+                    for other in snapshot._cache.get(kind, {}).values():  # pylint: disable=protected-access
+                        if (other.get('home_account_id') == entry['home_account_id']
+                                and other.get('environment') == entry['environment']
+                                and other is not token):
+                            raise CLIError('Another credential now uses the imported account; '
+                                           'refusing to remove it.')
 
 
 def _save_profile_if_current(directory, expected, replacement):
@@ -255,8 +265,13 @@ def _profile_already_restored(current, entry):
 
 def _imported_profile_matches(current, entry):
     expected = entry['imported_profile']
-    return current is not None and {k: v for k, v in current.items() if k != 'isDefault'} == {
-        k: v for k, v in expected.items() if k != 'isDefault'}
+    user = current.get('user') if current is not None else None
+    return (isinstance(user, dict)
+            and current.get('id', '').lower() == expected['id'].lower()
+            and current.get('tenantId', '').lower() == expected['tenantId'].lower()
+            and current.get('environmentName') == expected['environmentName']
+            and all(user.get(key) == expected['user'].get(key)
+                    for key in ('name', 'type')))
 
 
 def _load_cache_snapshot(cache):
@@ -287,6 +302,11 @@ def _add_cache_entries(cache, account, at, created):
             raise CLIError('A new account was added concurrently; refusing to replace it.')
         if not created and existing != account:
             raise CLIError('The existing MSAL account changed during import.')
+        if not created:
+            for refresh in snapshot._cache.get(snapshot.CredentialType.REFRESH_TOKEN, {}).values():  # pylint: disable=protected-access
+                if (refresh.get('home_account_id') == account['home_account_id']
+                        and refresh.get('environment') == account['environment']):
+                    raise CLIError('The existing MSAL account acquired a refresh token during import.')
         if created:
             snapshot.modify(snapshot.CredentialType.ACCOUNT, account, account)
         snapshot.modify(snapshot.CredentialType.ACCESS_TOKEN, at, at)
@@ -324,11 +344,14 @@ def _remove_cache_entries(cache, entry):
             _save_cache_snapshot(cache, snapshot)
 
 
-def _remove_locked(directory, cli_ctx, state, selected):
+def _remove_locked(directory, cli_ctx, state, selected, replacing=False):
     profile = _profile(directory)
     cache = _cache(directory, cli_ctx)
     entries = state['entries']
-    _assert_removable(cache, profile, entries, selected)
+    if replacing:
+        _assert_removable(cache, profile, entries, selected, replacing=True)
+    else:
+        _assert_removable(cache, profile, entries, selected)
     restored = _restore_profile(copy.deepcopy(profile), entries, selected)
     for sub_id in selected:
         entries[sub_id]['removing'] = True
@@ -341,65 +364,153 @@ def _remove_locked(directory, cli_ctx, state, selected):
     _save_json(directory / STATE_FILE, state)
 
 
-def import_access_token(cli_ctx, access_token, subscription_id):
+def _stored_token_expired(entry, cache, now):
+    expires_on = entry.get('expires_on')
+    if expires_on is None:
+        # Older state files did not record expiry. Read the exact cache key:
+        # MSAL search() can discard expired tokens before returning them.
+        with CrossPlatLock(cache._lock_location):  # pylint: disable=protected-access
+            snapshot = _load_cache_snapshot(cache)
+            key = snapshot.key_makers[snapshot.CredentialType.ACCESS_TOKEN](**entry)
+            token = snapshot._get(snapshot.CredentialType.ACCESS_TOKEN, key)  # pylint: disable=protected-access
+            if token and hashlib.sha256(token['secret'].encode()).hexdigest() == entry['token_sha256']:
+                try:
+                    expires_on = int(token['expires_on'])
+                except (KeyError, TypeError, ValueError):
+                    pass
+    return type(expires_on) is int and expires_on > 0 and expires_on <= now
+
+
+def _previous_cache_entries(cache, entry):
+    with CrossPlatLock(cache._lock_location):  # pylint: disable=protected-access
+        snapshot = _load_cache_snapshot(cache)
+        at_key = snapshot.key_makers[snapshot.CredentialType.ACCESS_TOKEN](**entry)
+        account_key = snapshot.key_makers[snapshot.CredentialType.ACCOUNT](**entry)
+        token = snapshot._get(snapshot.CredentialType.ACCESS_TOKEN, at_key)  # pylint: disable=protected-access
+        account = snapshot._get(snapshot.CredentialType.ACCOUNT, account_key)  # pylint: disable=protected-access
+        return copy.deepcopy(account), copy.deepcopy(token)
+
+
+def _restore_previous_import(directory, cli_ctx, sub_id, entry, original_profile,
+                             removed_profile, account, token):
+    state = _state(directory)
+    if sub_id in state['entries'] or _profile(directory) != removed_profile:
+        raise CLIError('Replacement left pending changes; run `az token-login remove` to recover.')
+    state['entries'][sub_id] = copy.deepcopy(entry)
+    state['entries'][sub_id]['pending'] = True
+    _save_json(directory / STATE_FILE, state)
+    if token:
+        if not account:
+            raise CLIError('The previous MSAL account is missing; cannot restore its token.')
+        _add_cache_entries(_cache(directory, cli_ctx), account, token, entry['created_account'])
+    _save_profile_if_current(directory, removed_profile, original_profile)
+    state['entries'][sub_id]['pending'] = False
+    _save_json(directory / STATE_FILE, state)
+
+
+def _import_locked(directory, cli_ctx, source, replacement=None):
+    profile = _profile(directory)
+    state = _state(directory)
+    cache = _cache(directory, cli_ctx)
+    sub_id = source.subscription_id
+    if sub_id in state['entries']:
+        raise CLIError('This subscription is already imported; use -f to replace its token.')
+    now = int(time.time())
+    if source.expires_on - now <= 300:
+        raise CLIError('The access token expired while preparing the import; obtain a new token.')
+    authority = _authority(cli_ctx)
+    scope = resource_to_scopes(cli_ctx.cloud.endpoints.active_directory_resource_id)[0]
+    prior = _record(profile, sub_id, cli_ctx.cloud.name)
+    account = _find_reusable_account(cache, prior, source, authority, scope)
+    created = account is None
+    if created:
+        account = _new_account(authority, source.tenant_id)
+    at = _new_at(source, account, authority, scope, now)
+    if _matching_at(cache, at):
+        raise CLIError('An access token already exists for the chosen MSAL account.')
+    pre_default = next((s.get('id') for s in profile['subscriptions']
+                        if s.get('environmentName') == cli_ctx.cloud.name
+                        and s.get('isDefault')), None)
+    new_sub = copy.deepcopy(prior) if prior else {}
+    new_sub.update({'id': sub_id, 'name': (prior or {}).get('name', sub_id),
+                    'state': 'Enabled', 'environmentName': cli_ctx.cloud.name,
+                    'tenantId': source.tenant_id,
+                    'user': {'name': account['username'], 'type': 'user'},
+                    'isDefault': (prior or {}).get('isDefault', False) or pre_default is None})
+    if replacement:
+        current, imported = replacement
+        new_sub.update(_changed_metadata(current, imported))
+        new_sub['isDefault'] = bool(current.get('isDefault'))
+    updated = copy.deepcopy(profile)
+    if prior:
+        updated['subscriptions'].remove(prior)
+    if replacement and new_sub['isDefault']:
+        for sub in updated['subscriptions']:
+            sub['isDefault'] = False
+    updated['subscriptions'].append(new_sub)
+    state['entries'][sub_id] = {'cloud': cli_ctx.cloud.name, 'previous_profile': prior,
+                                'imported_profile': copy.deepcopy(new_sub),
+                                'previous_default': pre_default,
+                                'username': account['username'], 'created_account': created,
+                                'home_account_id': account['home_account_id'],
+                                'environment': authority, 'realm': source.tenant_id,
+                                'client_id': AZURE_CLI_CLIENT_ID, 'target': scope,
+                                'token_sha256': hashlib.sha256(source.token.encode()).hexdigest(),
+                                'expires_on': source.expires_on, 'pending': True}
+    _save_json(directory / STATE_FILE, state)  # Recovery journal precedes credential writes.
+    try:
+        _add_cache_entries(cache, account, at, created)
+        _save_profile_if_current(directory, profile, updated)
+        state['entries'][sub_id]['pending'] = False
+        _save_json(directory / STATE_FILE, state)
+    except Exception:
+        try:
+            _remove_locked(directory, cli_ctx, state, [sub_id])
+        except Exception:
+            raise CLIError('Import failed; run `az token-login remove` to recover pending changes.') from None
+        raise CLIError('Import failed; pending changes were rolled back.') from None
+
+
+def import_access_token(cli_ctx, access_token, subscription_id, force=False):
     _check_version()
     source = parse_access_token(access_token, subscription_id,
                                 cli_ctx.cloud.endpoints.active_directory_resource_id)
     config_dir = _private_directory()
     with CrossPlatLock(str(config_dir / '.token-login.lock')):
-        profile = _profile(config_dir)
         state = _state(config_dir)
-        cache = _cache(config_dir, cli_ctx)
         sub_id = source.subscription_id
-        if sub_id in state['entries']:
-            raise CLIError('This subscription is already imported; remove its import before replacing it.')
-        now = int(time.time())
-        if source.expires_on - now <= 300:
-            raise CLIError('The access token expired while preparing the import; obtain a new token.')
-        authority = _authority(cli_ctx)
-        scope = resource_to_scopes(cli_ctx.cloud.endpoints.active_directory_resource_id)[0]
-        prior = _record(profile, sub_id, cli_ctx.cloud.name)
-        account = _find_reusable_account(cache, prior, source, authority, scope)
-        created = account is None
-        if created:
-            account = _new_account(authority, source.tenant_id)
-        at = _new_at(source, account, authority, scope, now)
-        if _matching_at(cache, at):
-            raise CLIError('An access token already exists for the chosen MSAL account.')
-        pre_default = next((s.get('id') for s in profile['subscriptions']
-                            if s.get('environmentName') == cli_ctx.cloud.name
-                            and s.get('isDefault')), None)
-        new_sub = copy.deepcopy(prior) if prior else {}
-        new_sub.update({'id': sub_id, 'name': (prior or {}).get('name', sub_id),
-                        'state': 'Enabled', 'environmentName': cli_ctx.cloud.name,
-                        'tenantId': source.tenant_id,
-                        'user': {'name': account['username'], 'type': 'user'},
-                        'isDefault': (prior or {}).get('isDefault', False) or pre_default is None})
-        updated = copy.deepcopy(profile)
-        if prior:
-            updated['subscriptions'].remove(prior)
-        updated['subscriptions'].append(new_sub)
-        state['entries'][sub_id] = {'cloud': cli_ctx.cloud.name, 'previous_profile': prior,
-                                    'imported_profile': copy.deepcopy(new_sub),
-                                    'previous_default': pre_default,
-                                    'username': account['username'], 'created_account': created,
-                                    'home_account_id': account['home_account_id'],
-                                    'environment': authority, 'realm': source.tenant_id,
-                                    'client_id': AZURE_CLI_CLIENT_ID, 'target': scope,
-                                    'token_sha256': hashlib.sha256(source.token.encode()).hexdigest(),
-                                    'pending': True}
-        _save_json(config_dir / STATE_FILE, state)  # Recovery journal precedes credential writes.
+        previous = copy.deepcopy(state['entries'].get(sub_id))
+        replacement = None
+        if previous:
+            if previous['pending'] or previous.get('removing'):
+                raise CLIError('An import or removal is unfinished; run `az token-login remove` first.')
+            if previous['cloud'] != cli_ctx.cloud.name:
+                raise CLIError('This subscription was imported under another cloud; remove it there first.')
+            cache = _cache(config_dir, cli_ctx)
+            if not force and not _stored_token_expired(previous, cache, int(time.time())):
+                raise CLIError('This subscription is already imported; use -f to replace its token.')
+            if source.expires_on - int(time.time()) <= 300:
+                raise CLIError('The access token expired while preparing the replacement; '
+                               'obtain a new token.')
+            original_profile = _profile(config_dir)
+            current = _record(original_profile, sub_id, cli_ctx.cloud.name)
+            account, token = _previous_cache_entries(cache, previous)
+            _remove_locked(config_dir, cli_ctx, state, [sub_id], replacing=True)
+            removed_profile = _profile(config_dir)
+            replacement = (current, previous['imported_profile'])
         try:
-            _add_cache_entries(cache, account, at, created)
-            _save_profile_if_current(config_dir, profile, updated)
-            state['entries'][sub_id]['pending'] = False
-            _save_json(config_dir / STATE_FILE, state)
+            _import_locked(config_dir, cli_ctx, source, replacement=replacement)
         except Exception:
-            try:
-                _remove_locked(config_dir, cli_ctx, state, [sub_id])
-            except Exception:
-                raise CLIError('Import failed; run `az token-login remove` to recover pending changes.') from None
-            raise CLIError('Import failed; pending changes were rolled back.') from None
+            if previous:
+                try:
+                    _restore_previous_import(config_dir, cli_ctx, sub_id, previous,
+                                             original_profile, removed_profile, account, token)
+                except Exception:
+                    raise CLIError('Replacement failed and the previous import could not be '
+                                   'safely restored; check login state and run '
+                                   '`az token-login remove` if an import is pending.') from None
+                raise CLIError('Replacement failed; the previous import was restored.') from None
+            raise
 
 
 def remove_files(cli_ctx, subscription_id=None):

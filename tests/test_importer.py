@@ -121,6 +121,35 @@ class TokenLoginTests(unittest.TestCase):
         importer.remove_files(self.cli_ctx)
         self.assertEqual(list(self.cache().search(cache.CredentialType.ACCOUNT)), [account])
 
+    def test_reused_account_rechecks_refresh_token_under_cache_lock(self):
+        old = {'id': SUB, 'name': 'Old name', 'tenantId': TENANT,
+               'environmentName': 'AzureCloud', 'state': 'Enabled', 'isDefault': True,
+               'user': {'name': 'existing@example.invalid', 'type': 'user'}}
+        (self.config_dir / 'azureProfile.json').write_text(json.dumps({'subscriptions': [old]}))
+        account = {'home_account_id': OID + '.' + TENANT,
+                   'environment': AUTHORITY, 'realm': TENANT,
+                   'local_account_id': OID, 'username': old['user']['name'],
+                   'authority_type': 'MSSTS'}
+        cache = self.cache()
+        cache.modify(cache.CredentialType.ACCOUNT, account, account)
+        original_add = importer._add_cache_entries
+
+        def add_refresh_before_token(target_cache, selected_account, at, created):
+            refresh = {'credential_type': 'RefreshToken', 'secret': 'fabricated-refresh',
+                       'home_account_id': account['home_account_id'],
+                       'environment': AUTHORITY, 'client_id': AZURE_CLI_CLIENT_ID,
+                       'target': SCOPE}
+            other = self.cache()
+            other.modify(other.CredentialType.REFRESH_TOKEN, refresh, refresh)
+            return original_add(target_cache, selected_account, at, created)
+
+        with mock.patch.object(importer, '_add_cache_entries', side_effect=add_refresh_before_token):
+            with self.assertRaisesRegex(CLIError, 'rolled back'):
+                importer.import_access_token(self.cli_ctx, jwt(), SUB)
+        self.assertEqual(self.profile()['subscriptions'], [old])
+        self.assertFalse(list(self.cache().search('AccessToken')))
+        self.assertEqual(len(list(self.cache().search('RefreshToken'))), 1)
+
     def test_existing_refresh_token_is_preserved_and_not_borrowed(self):
         old = {'id': SUB, 'name': 'Old name', 'tenantId': TENANT,
                'environmentName': 'AzureCloud', 'state': 'Enabled', 'isDefault': True,
@@ -201,6 +230,259 @@ class TokenLoginTests(unittest.TestCase):
             importer.import_access_token(self.cli_ctx, jwt(oid=OTHER_SUB), SUB)
         self.assertEqual(len(list(self.cache().search('AccessToken'))), 1)
         importer.remove_files(self.cli_ctx)
+
+    def test_force_replaces_token_and_restores_original_association(self):
+        old = {'id': SUB, 'name': 'Original', 'tenantId': TENANT,
+               'environmentName': 'AzureCloud', 'state': 'Enabled', 'isDefault': True,
+               'user': {'name': 'existing@example.invalid', 'type': 'user'}}
+        (self.config_dir / 'azureProfile.json').write_text(json.dumps({'subscriptions': [old]}))
+        original = jwt()
+        replacement = jwt(tenant=SECOND_TENANT)
+        importer.import_access_token(self.cli_ctx, original, SUB)
+        importer.import_access_token(self.cli_ctx, replacement, SUB, force=True)
+        self.assertEqual([a['secret'] for a in self.cache().search('AccessToken')], [replacement])
+        self.assertEqual(importer._state(self.config_dir)['entries'][SUB]['previous_profile'], old)
+        importer.import_access_token(self.cli_ctx, jwt(), SUB, force=True)
+        importer.remove_files(self.cli_ctx, SUB)
+        self.assertEqual(self.profile()['subscriptions'], [old])
+        self.assertFalse(list(self.cache().search('AccessToken')))
+
+    def test_replacement_preserves_active_subscription(self):
+        unrelated = {'id': OTHER_SUB, 'name': 'Unrelated', 'tenantId': TENANT,
+                     'environmentName': 'AzureCloud', 'state': 'Enabled', 'isDefault': True,
+                     'user': {'name': 'existing@example.invalid', 'type': 'user'}}
+        (self.config_dir / 'azureProfile.json').write_text(json.dumps({
+            'subscriptions': [unrelated]}))
+        importer.import_access_token(self.cli_ctx, jwt(), SUB)
+        profile = self.profile()
+        importer._record(profile, OTHER_SUB, 'AzureCloud')['isDefault'] = False
+        importer._record(profile, SUB, 'AzureCloud')['isDefault'] = True
+        importer._save_json(self.config_dir / importer.PROFILE_FILE, profile)
+        importer.import_access_token(self.cli_ctx, jwt(oid=OTHER_SUB), SUB, force=True)
+        profile = self.profile()
+        self.assertTrue(importer._record(profile, SUB, 'AzureCloud')['isDefault'])
+        self.assertFalse(importer._record(profile, OTHER_SUB, 'AzureCloud')['isDefault'])
+        importer.remove_files(self.cli_ctx, SUB)
+        self.assertTrue(importer._record(self.profile(), OTHER_SUB, 'AzureCloud')['isDefault'])
+
+    def test_replacement_preserves_new_subscription_metadata(self):
+        importer.import_access_token(self.cli_ctx, jwt(), SUB)
+        profile = self.profile()
+        profile['subscriptions'][0].update(name='Friendly subscription', state='Disabled',
+                                           tenantDisplayName='Updated tenant')
+        importer._save_json(self.config_dir / importer.PROFILE_FILE, profile)
+        importer.import_access_token(self.cli_ctx, jwt(oid=OTHER_SUB), SUB, force=True)
+        imported = importer._record(self.profile(), SUB, 'AzureCloud')
+        self.assertEqual(imported['name'], 'Friendly subscription')
+        self.assertEqual(imported['state'], 'Disabled')
+        self.assertEqual(imported['tenantDisplayName'], 'Updated tenant')
+        importer.remove_files(self.cli_ctx, SUB)
+
+    def test_replacement_restores_old_token_if_new_one_expires_midway(self):
+        now = int(time.time())
+        original = jwt(expires=now + 3600)
+        importer.import_access_token(self.cli_ctx, original, SUB)
+        original_remove = importer._remove_locked
+        clock = {'now': now}
+
+        def remove_then_advance(*args, **kwargs):
+            result = original_remove(*args, **kwargs)
+            clock['now'] += 1
+            return result
+
+        with mock.patch.object(importer.time, 'time', side_effect=lambda: clock['now']), \
+             mock.patch.object(importer, '_remove_locked', side_effect=remove_then_advance):
+            with self.assertRaisesRegex(CLIError, 'previous import was restored'):
+                importer.import_access_token(self.cli_ctx, jwt(expires=now + 301),
+                                             SUB, force=True)
+        self.assertEqual([a['secret'] for a in self.cache().search('AccessToken')], [original])
+        self.assertIn(SUB, importer._state(self.config_dir)['entries'])
+        importer.remove_files(self.cli_ctx, SUB)
+
+    def test_removal_accepts_case_only_subscription_id_change(self):
+        subscription = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+        importer.import_access_token(self.cli_ctx, jwt(), subscription)
+        profile = self.profile()
+        profile['subscriptions'][0]['id'] = subscription.upper()
+        importer._save_json(self.config_dir / importer.PROFILE_FILE, profile)
+        self.assertEqual(importer.remove_files(self.cli_ctx, subscription), 1)
+        self.assertEqual(self.profile()['subscriptions'], [])
+        self.assertFalse(list(self.cache().search('AccessToken')))
+
+    def test_replacement_preserves_original_disabled_state(self):
+        old = {'id': SUB, 'name': 'Original', 'tenantId': TENANT,
+               'environmentName': 'AzureCloud', 'state': 'Disabled', 'isDefault': True,
+               'user': {'name': 'existing@example.invalid', 'type': 'user'}}
+        (self.config_dir / 'azureProfile.json').write_text(json.dumps({'subscriptions': [old]}))
+        importer.import_access_token(self.cli_ctx, jwt(), SUB)
+        importer.import_access_token(self.cli_ctx, jwt(oid=OTHER_SUB), SUB, force=True)
+        importer.remove_files(self.cli_ctx, SUB)
+        self.assertEqual(self.profile()['subscriptions'], [old])
+
+    def test_replacement_carries_profile_metadata_changes(self):
+        old = {'id': SUB, 'name': 'Original', 'tenantId': TENANT,
+               'environmentName': 'AzureCloud', 'state': 'Enabled', 'isDefault': True,
+               'user': {'name': 'existing@example.invalid', 'type': 'user'}}
+        (self.config_dir / 'azureProfile.json').write_text(json.dumps({'subscriptions': [old]}))
+        importer.import_access_token(self.cli_ctx, jwt(), SUB)
+        profile = self.profile()
+        profile['subscriptions'][0]['state'] = 'Disabled'
+        importer._save_json(self.config_dir / importer.PROFILE_FILE, profile)
+        importer.import_access_token(self.cli_ctx, jwt(oid=OTHER_SUB), SUB, force=True)
+        importer.remove_files(self.cli_ctx, SUB)
+        self.assertEqual(self.profile()['subscriptions'][0]['state'], 'Disabled')
+
+    def test_expired_token_is_replaced_without_force(self):
+        now = int(time.time())
+        importer.import_access_token(self.cli_ctx, jwt(expires=now + 3600), SUB)
+        replacement = jwt(expires=now + 7200)
+        with mock.patch.object(importer.time, 'time', return_value=now + 3600):
+            importer.import_access_token(self.cli_ctx, replacement, SUB)
+        self.assertEqual([a['secret'] for a in self.cache().search('AccessToken')], [replacement])
+        importer.remove_files(self.cli_ctx, SUB)
+
+    def test_unexpired_token_requires_force_even_near_expiry(self):
+        now = int(time.time())
+        importer.import_access_token(self.cli_ctx, jwt(expires=now + 3600), SUB)
+        with mock.patch.object(importer.time, 'time', return_value=now + 3599):
+            with self.assertRaisesRegex(CLIError, 'already imported'):
+                importer.import_access_token(self.cli_ctx, jwt(expires=now + 7200), SUB)
+        importer.remove_files(self.cli_ctx, SUB)
+
+    def test_expired_legacy_state_reads_exact_cached_token(self):
+        now = int(time.time())
+        importer.import_access_token(self.cli_ctx, jwt(expires=now + 3600), SUB)
+        state = importer._state(self.config_dir)
+        del state['entries'][SUB]['expires_on']
+        importer._save_json(self.config_dir / importer.STATE_FILE, state)
+        replacement = jwt(expires=now + 7200)
+        with mock.patch.object(importer.time, 'time', return_value=now + 3600):
+            importer.import_access_token(self.cli_ctx, replacement, SUB)
+        self.assertEqual([a['secret'] for a in self.cache().search('AccessToken')], [replacement])
+        importer.remove_files(self.cli_ctx, SUB)
+
+    def test_missing_legacy_token_requires_force(self):
+        importer.import_access_token(self.cli_ctx, jwt(), SUB)
+        state = importer._state(self.config_dir)
+        del state['entries'][SUB]['expires_on']
+        importer._save_json(self.config_dir / importer.STATE_FILE, state)
+        cache = self.cache()
+        cache.remove_at(next(iter(cache.search('AccessToken'))))
+        with self.assertRaisesRegex(CLIError, 'already imported'):
+            importer.import_access_token(self.cli_ctx, jwt(oid=OTHER_SUB), SUB)
+        importer.import_access_token(self.cli_ctx, jwt(oid=OTHER_SUB), SUB, force=True)
+        importer.remove_files(self.cli_ctx, SUB)
+
+    def test_expired_record_with_missing_token_can_be_replaced(self):
+        now = int(time.time())
+        importer.import_access_token(self.cli_ctx, jwt(expires=now + 3600), SUB)
+        cache = self.cache()
+        cache.remove_at(next(iter(cache.search('AccessToken'))))
+        replacement = jwt(expires=now + 7200)
+        with mock.patch.object(importer.time, 'time', return_value=now + 3600):
+            importer.import_access_token(self.cli_ctx, replacement, SUB)
+        self.assertEqual([a['secret'] for a in self.cache().search('AccessToken')], [replacement])
+        importer.remove_files(self.cli_ctx, SUB)
+
+    def test_expired_changed_token_is_not_replaced(self):
+        now = int(time.time())
+        importer.import_access_token(self.cli_ctx, jwt(expires=now + 3600), SUB)
+        cache = self.cache()
+        original = next(iter(cache.search('AccessToken')))
+        cache.modify(cache.CredentialType.ACCESS_TOKEN, original,
+                     {'secret': jwt(oid=OTHER_SUB, expires=now + 7200)})
+        with mock.patch.object(importer.time, 'time', return_value=now + 3600):
+            with self.assertRaisesRegex(CLIError, 'cached token'):
+                importer.import_access_token(self.cli_ctx, jwt(expires=now + 7200), SUB)
+        self.assertIn(SUB, importer._state(self.config_dir)['entries'])
+
+    def test_force_does_not_replace_changed_cached_token(self):
+        importer.import_access_token(self.cli_ctx, jwt(), SUB)
+        cache = self.cache()
+        original = next(iter(cache.search('AccessToken')))
+        replacement = jwt(oid=OTHER_SUB)
+        cache.modify(cache.CredentialType.ACCESS_TOKEN, original, {'secret': replacement})
+        with self.assertRaisesRegex(CLIError, 'cached token'):
+            importer.import_access_token(self.cli_ctx, jwt(tenant=SECOND_TENANT), SUB, force=True)
+        self.assertIn(SUB, importer._state(self.config_dir)['entries'])
+        self.assertEqual(next(iter(self.cache().search('AccessToken')))['secret'], replacement)
+
+    def test_replacement_does_not_take_over_changed_profile(self):
+        importer.import_access_token(self.cli_ctx, jwt(), SUB)
+        profile = self.profile()
+        profile['subscriptions'][0]['user']['name'] = 'different@example.invalid'
+        importer._save_json(self.config_dir / importer.PROFILE_FILE, profile)
+        with self.assertRaisesRegex(CLIError, 'another login'):
+            importer.import_access_token(self.cli_ctx, jwt(oid=OTHER_SUB), SUB, force=True)
+        self.assertEqual(self.profile(), profile)
+        self.assertIn(SUB, importer._state(self.config_dir)['entries'])
+        self.assertEqual(importer.remove_files(self.cli_ctx, SUB), 1)
+        self.assertEqual(self.profile(), profile)
+        self.assertFalse(list(self.cache().search('AccessToken')))
+
+    def test_extra_user_metadata_does_not_block_removal(self):
+        importer.import_access_token(self.cli_ctx, jwt(), SUB)
+        profile = self.profile()
+        profile['subscriptions'][0]['user']['displayName'] = 'Updated name'
+        importer._save_json(self.config_dir / importer.PROFILE_FILE, profile)
+        self.assertEqual(importer.remove_files(self.cli_ctx, SUB), 1)
+        self.assertEqual(self.profile()['subscriptions'], [])
+
+    def test_removal_leaves_external_profile_replacement_intact(self):
+        old = {'id': SUB, 'name': 'Original', 'tenantId': TENANT,
+               'environmentName': 'AzureCloud', 'state': 'Enabled', 'isDefault': True,
+               'user': {'name': 'existing@example.invalid', 'type': 'user'}}
+        (self.config_dir / 'azureProfile.json').write_text(json.dumps({'subscriptions': [old]}))
+        importer.import_access_token(self.cli_ctx, jwt(), SUB)
+        replacement = dict(old, user={'name': 'new@example.invalid', 'type': 'user'})
+        importer._save_json(self.config_dir / importer.PROFILE_FILE,
+                            {'subscriptions': [replacement]})
+        self.assertEqual(importer.remove_files(self.cli_ctx, SUB), 1)
+        self.assertEqual(self.profile()['subscriptions'], [replacement])
+        self.assertFalse(list(self.cache().search('AccessToken')))
+
+    def test_missing_profile_record_does_not_block_removal(self):
+        importer.import_access_token(self.cli_ctx, jwt(), SUB)
+        importer._save_json(self.config_dir / importer.PROFILE_FILE, {'subscriptions': []})
+        self.assertEqual(importer.remove_files(self.cli_ctx, SUB), 1)
+        self.assertEqual(self.profile()['subscriptions'], [])
+        self.assertFalse(importer._state(self.config_dir)['entries'])
+
+    def test_pending_import_cannot_be_replaced(self):
+        importer.import_access_token(self.cli_ctx, jwt(), SUB)
+        state = importer._state(self.config_dir)
+        state['entries'][SUB]['pending'] = True
+        importer._save_json(self.config_dir / importer.STATE_FILE, state)
+        with self.assertRaisesRegex(CLIError, 'unfinished'):
+            importer.import_access_token(self.cli_ctx, jwt(oid=OTHER_SUB), SUB, force=True)
+        importer.remove_files(self.cli_ctx, SUB)
+
+    def test_failed_replacement_restores_previous_profile(self):
+        old = {'id': SUB, 'name': 'Original', 'tenantId': TENANT,
+               'environmentName': 'AzureCloud', 'state': 'Enabled', 'isDefault': True,
+               'user': {'name': 'existing@example.invalid', 'type': 'user'}}
+        (self.config_dir / 'azureProfile.json').write_text(json.dumps({'subscriptions': [old]}))
+        original_token = jwt()
+        importer.import_access_token(self.cli_ctx, original_token, SUB)
+        original_save = importer._save_json
+        failure = {'once': True}
+
+        def fail_new_profile(path, value):
+            if (path.name == importer.PROFILE_FILE and failure['once']
+                    and importer._record(value, SUB, 'AzureCloud')['user']['name'] != old['user']['name']):
+                failure['once'] = False
+                raise OSError('simulated replacement failure')
+            return original_save(path, value)
+
+        with mock.patch.object(importer, '_save_json', side_effect=fail_new_profile):
+            with self.assertRaisesRegex(CLIError, 'Replacement failed'):
+                importer.import_access_token(self.cli_ctx, jwt(oid=OTHER_SUB), SUB, force=True)
+        self.assertEqual(importer._state(self.config_dir)['entries'][SUB]['previous_profile'], old)
+        self.assertNotEqual(self.profile()['subscriptions'], [old])
+        self.assertEqual([a['secret'] for a in self.cache().search('AccessToken')],
+                         [original_token])
+        importer.remove_files(self.cli_ctx, SUB)
+        self.assertEqual(self.profile()['subscriptions'], [old])
 
     def test_changed_cache_entry_is_not_deleted(self):
         importer.import_access_token(self.cli_ctx, jwt(), SUB)
@@ -295,14 +577,22 @@ class TokenLoginTests(unittest.TestCase):
         importer.remove_files(self.cli_ctx)
         self.assertEqual(self.profile()['subscriptions'], [unrelated])
 
-    def test_changed_imported_profile_is_not_overwritten_on_removal(self):
+    def test_changed_imported_profile_metadata_is_preserved_on_removal(self):
+        old = {'id': SUB, 'name': 'Original', 'tenantId': TENANT,
+               'environmentName': 'AzureCloud', 'state': 'Enabled', 'isDefault': True,
+               'user': {'name': 'existing@example.invalid', 'type': 'user'}}
+        (self.config_dir / 'azureProfile.json').write_text(json.dumps({'subscriptions': [old]}))
         importer.import_access_token(self.cli_ctx, jwt(), SUB)
         profile = self.profile()
-        profile['subscriptions'][0]['state'] = 'Disabled'
+        profile['subscriptions'][0].update(name='Updated', state='Disabled',
+                                           tenantDisplayName='Updated tenant')
         importer._save_json(self.config_dir / importer.PROFILE_FILE, profile)
-        with self.assertRaisesRegex(CLIError, 'changed'):
-            importer.remove_files(self.cli_ctx)
-        self.assertEqual(self.profile()['subscriptions'][0]['state'], 'Disabled')
+        self.assertEqual(importer.remove_files(self.cli_ctx, SUB), 1)
+        restored, = self.profile()['subscriptions']
+        self.assertEqual(restored['user'], old['user'])
+        self.assertEqual(restored['name'], 'Updated')
+        self.assertEqual(restored['state'], 'Disabled')
+        self.assertEqual(restored['tenantDisplayName'], 'Updated tenant')
 
     def test_concurrent_profile_change_aborts_import_without_discarding_it(self):
         extra = {'id': OTHER_SUB, 'name': 'Concurrent entry', 'tenantId': TENANT,
