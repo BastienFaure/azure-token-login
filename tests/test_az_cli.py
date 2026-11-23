@@ -44,6 +44,15 @@ class AzureCliIntegrationTests(unittest.TestCase):
 
             installed = az('extension', 'add', '--source', str(wheel), '--yes')
             self.assertEqual(installed.returncode, 0, installed.stderr)
+            empty_imports = az('token-login', 'list')
+            self.assertEqual(empty_imports.returncode, 0, empty_imports.stderr)
+            self.assertEqual(json.loads(empty_imports.stdout), [])
+            fresh_env = dict(env, AZURE_CONFIG_DIR=str(base / 'fresh-config'),
+                             AZURE_EXTENSION_DIR=str(config / 'cliextensions'))
+            fresh_list = subprocess.run(['az', 'token-login', 'list', '--output', 'json'],
+                                        env=fresh_env, capture_output=True, text=True, timeout=45)
+            self.assertEqual(fresh_list.returncode, 0, fresh_list.stderr)
+            self.assertEqual(json.loads(fresh_list.stdout), [])
             missing = az('token-login', 'import', '--subscription-id', SUB)
             self.assertNotEqual(missing.returncode, 0)
             imported = az('token-login', 'import', '--access-token', fabricated_token,
@@ -56,6 +65,19 @@ class AzureCliIntegrationTests(unittest.TestCase):
             forced = az('token-login', 'import', '--access-token', replacement_token,
                         '--subscription-id', SUB, '-f')
             self.assertEqual(forced.returncode, 0, forced.stderr)
+            listed_imports = az('token-login', 'list')
+            self.assertEqual(listed_imports.returncode, 0, listed_imports.stderr)
+            rows = json.loads(listed_imports.stdout)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]['subscriptionId'], SUB)
+            self.assertEqual(rows[0]['tokenStatus'], 'valid')
+            self.assertNotIn(fabricated_token, listed_imports.stdout)
+            self.assertNotIn(replacement_token, listed_imports.stdout)
+            table = subprocess.run(['az', 'token-login', 'list', '--output', 'table'],
+                                   env=env, capture_output=True, text=True, timeout=45)
+            self.assertEqual(table.returncode, 0, table.stderr)
+            self.assertIn(SUB, table.stdout)
+            self.assertNotIn(replacement_token, table.stdout)
             account = az('account', 'show')
             self.assertEqual(account.returncode, 0, account.stderr)
             self.assertEqual(json.loads(account.stdout)['id'], SUB)
@@ -92,6 +114,9 @@ class AzureCliIntegrationTests(unittest.TestCase):
             removed = az('token-login', 'remove', '--subscription-id', SUB)
             self.assertEqual(removed.returncode, 0, removed.stderr)
             self.assertEqual(json.loads(removed.stdout)['removedSubscriptions'], 1)
+            empty_imports = az('token-login', 'list')
+            self.assertEqual(empty_imports.returncode, 0, empty_imports.stderr)
+            self.assertEqual(json.loads(empty_imports.stdout), [])
             old_spelling = az('token-login', 'import', '--access--token', fabricated_token,
                               '--subscription-id', SUB)
             self.assertNotEqual(old_spelling.returncode, 0)

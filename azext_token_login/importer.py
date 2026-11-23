@@ -12,6 +12,7 @@ import stat
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 from importlib.metadata import version
 from pathlib import Path
 from urllib.parse import urlparse
@@ -28,7 +29,7 @@ from knack.util import CLIError
 from msal_extensions import CrossPlatLock
 from msal_extensions.persistence import PersistenceNotFound
 
-from .token import guid, parse_access_token
+from .token import MIN_LIFETIME, guid, parse_access_token
 
 PROFILE_FILE = 'azureProfile.json'
 STATE_FILE = 'token-login-state.json'
@@ -45,16 +46,18 @@ def _check_version():
                        'be retested after an upgrade.')
 
 
-def _private_directory():
+def _private_directory(create=True):
     directory = Path(get_config_dir()).expanduser()
     try:
         info = directory.lstat()
     except FileNotFoundError:
+        if not create:
+            return None
         directory.mkdir(mode=0o700, parents=True)
         info = directory.lstat()
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
         raise CLIError('Azure config directory must be owned by you and mode 0700. '
-                       'Secure ~/.azure or use a private AZURE_CONFIG_DIR before importing tokens.')
+                       'Secure ~/.azure or use a private AZURE_CONFIG_DIR before using token-login.')
     return directory
 
 
@@ -102,7 +105,7 @@ def _profile(directory):
     return profile
 
 
-def _cache(directory, cli_ctx):
+def _cache_file(directory, cli_ctx):
     if should_encrypt_token_cache(cli_ctx):
         raise CLIError('Encrypted Azure CLI token caches are not supported by this extension.')
     cache_file = directory / 'msal_token_cache.json'
@@ -110,7 +113,25 @@ def _cache(directory, cli_ctx):
         raise CLIError('MSAL token cache must be a regular file, not a symlink.')
     if cache_file.exists() and cache_file.stat().st_mode & 0o077:
         raise CLIError('MSAL token cache must have owner-only file permissions (0600).')
+    return cache_file
+
+
+def _cache(directory, cli_ctx):
+    _cache_file(directory, cli_ctx)
     return load_persisted_token_cache(str(directory / 'msal_token_cache'), encrypt=False)
+
+
+def _read_cache_snapshot(directory, cli_ctx):
+    cache_file = _cache_file(directory, cli_ctx)
+    snapshot = msal.SerializableTokenCache()
+    if cache_file.exists():
+        try:
+            snapshot.deserialize(cache_file.read_text(encoding='utf-8'))
+            if not isinstance(snapshot._cache, dict):  # pylint: disable=protected-access
+                raise ValueError('Invalid MSAL cache structure')
+        except (OSError, UnicodeError, ValueError, TypeError, RecursionError):
+            raise CLIError('Could not read MSAL token cache; no credentials were changed.') from None
+    return snapshot
 
 
 def _authority(cli_ctx):
@@ -528,3 +549,92 @@ def remove_files(cli_ctx, subscription_id=None):
         if selected:
             _remove_locked(config_dir, cli_ctx, state, selected)
     return len(selected)
+
+
+def _listed_expiry(entry, token, matches):
+    state_expiry = entry.get('expires_on')
+    if type(state_expiry) is not int or state_expiry <= 0:
+        state_expiry = None
+    if matches:
+        cached = token.get('expires_on')
+        cache_expiry = None
+        if isinstance(cached, str) and cached.isascii() and cached.isdecimal():
+            try:
+                cache_expiry = int(cached)
+            except ValueError:
+                pass
+        if cache_expiry is None or cache_expiry <= 0:
+            return None, None  # MSAL cannot use a token with an unknown cache expiry.
+        expires_on = min(state_expiry, cache_expiry) if state_expiry else cache_expiry
+    else:
+        expires_on = state_expiry
+    if expires_on is None:
+        return None, None
+    try:
+        timestamp = datetime.fromtimestamp(expires_on, timezone.utc).isoformat().replace('+00:00', 'Z')
+    except (OverflowError, OSError, ValueError):
+        return None, None
+    return expires_on, timestamp
+
+
+def list_imports(cli_ctx):
+    _check_version()
+    directory = Path(get_config_dir()).expanduser()
+    state_file = directory / STATE_FILE
+    if not state_file.exists() and not state_file.is_symlink():
+        return []  # Azure CLI itself may have created a new, non-private config directory.
+    directory = _private_directory(create=False)
+    if directory is None:
+        return []
+    entries = _state(directory)['entries']
+    if not entries:
+        return []
+    if not all(isinstance(sub_id, str) for sub_id in entries):
+        raise CLIError('Unrecognized token-login state; cannot list imports.')
+    profile = _profile(directory)
+    snapshot = _read_cache_snapshot(directory, cli_ctx)
+    now = int(time.time())
+    result = []
+    for sub_id, entry in sorted(entries.items()):
+        try:
+            if not isinstance(entry, dict):
+                raise ValueError('Invalid state entry')
+            cloud = entry['cloud']
+            imported = entry['imported_profile']
+            if not isinstance(cloud, str) or not isinstance(imported, dict):
+                raise ValueError('Invalid profile entry')
+            current = _record(profile, sub_id.lower(), cloud)
+            associated = _imported_profile_matches(current, entry)
+            key = snapshot.key_makers[snapshot.CredentialType.ACCESS_TOKEN](**entry)
+            token = snapshot._get(snapshot.CredentialType.ACCESS_TOKEN, key)  # pylint: disable=protected-access
+            account_key = snapshot.key_makers[snapshot.CredentialType.ACCOUNT](**entry)
+            account = snapshot._get(snapshot.CredentialType.ACCOUNT, account_key)  # pylint: disable=protected-access
+            account_status = ('missing' if account is None else
+                              'present' if account.get('username') == entry['username'] else 'changed')
+            matches = (token is not None and isinstance(token.get('secret'), str)
+                       and hashlib.sha256(token['secret'].encode()).hexdigest() == entry['token_sha256'])
+            expires_on, expires_at = _listed_expiry(entry, token, matches)
+            if token is None:
+                token_status = 'missing'
+            elif not matches:
+                token_status = 'changed'
+            elif expires_on is None:
+                token_status = 'unknown'
+            elif expires_on <= now:
+                token_status = 'expired'
+            elif expires_on - now <= MIN_LIFETIME:
+                token_status = 'expiring'
+            else:
+                token_status = 'valid'
+            result.append({'subscriptionId': sub_id, 'name': (current if associated else imported).get('name'),
+                           'tenantId': imported.get('tenantId'), 'cloud': cloud,
+                           'isDefault': bool(current.get('isDefault')) if associated else None,
+                           'expiresOn': expires_at, 'tokenStatus': token_status,
+                           'accountStatus': account_status,
+                           'profileStatus': ('associated' if associated else
+                                             'missing' if current is None else 'changed'),
+                           'operationStatus': ('removing' if entry.get('removing') else
+                                               'pending' if entry.get('pending') else 'complete')})
+        except (KeyError, TypeError, AttributeError, ValueError):
+            raise CLIError('Unrecognized token-login state; cannot list imports.') from None
+    return result

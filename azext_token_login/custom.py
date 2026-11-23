@@ -1,6 +1,6 @@
 """Azure CLI handlers for access-token imports."""
 
-from .importer import import_access_token, remove_files
+from .importer import import_access_token, list_imports, remove_files
 
 
 def import_token(cmd, access_token, subscription_id, force=False):
@@ -8,6 +8,10 @@ def import_token(cmd, access_token, subscription_id, force=False):
                         subscription_id=subscription_id, force=force)
     return {'importedSubscriptions': 1,
             'note': 'Access tokens cannot be refreshed; use a new token before it expires.'}
+
+
+def list_tokens(cmd):
+    return list_imports(cmd.cli_ctx)
 
 
 def remove_imports(cmd, subscription_id=None):

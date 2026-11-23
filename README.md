@@ -76,6 +76,54 @@ profile entry alone and cleans up only the original imported credential. A chang
 cached token or shared account still prevents removal to avoid deleting another
 login's credentials.
 
+## List imported subscriptions
+
+```sh
+az token-login list --output table
+az token-login list --output json
+```
+
+Example (fabricated values):
+
+```json
+[
+  {
+    "subscriptionId": "33333333-3333-4333-8333-333333333333",
+    "name": "Example subscription",
+    "tenantId": "11111111-1111-4111-8111-111111111111",
+    "cloud": "AzureCloud",
+    "isDefault": true,
+    "expiresOn": "2027-01-01T00:00:00Z",
+    "tokenStatus": "valid",
+    "accountStatus": "present",
+    "profileStatus": "associated",
+    "operationStatus": "complete"
+  }
+]
+```
+
+`list` reports only imports tracked by this extension, including imports from
+other Azure clouds. It returns an empty array when none are recorded. Each row
+contains the subscription ID, name, tenant ID, cloud, whether it is currently
+the default (`null` if the profile association changed or disappeared), and
+the effective expiry time in UTC (`expiresOn`, or `null` if unknown). The
+effective expiry is the earlier of the imported token's recorded expiry and its
+current MSAL cache expiry. `tokenStatus` is `valid`, `expiring`
+(five minutes or less remain), `expired`, `missing`, `changed` (the cached token
+no longer matches this import), or `unknown` (expiry unavailable).
+`accountStatus` reports whether the matching MSAL account is `present`,
+`missing`, or `changed`. `profileStatus` identifies whether the subscription is
+still associated with the imported account; `operationStatus` identifies
+interrupted imports or removals. Even with `valid` / `present` / `associated`
+statuses, only Azure can verify the token's signature and permissions.
+
+**The extension never prints bearer tokens or token hashes.** Its list handler
+does not change profile/state/cache contents or create a config directory.
+Azure CLI itself may create configuration and command-log files before the
+extension runs; when no imports are recorded, listing still returns `[]`.
+Because listing does not take the import lock, running it concurrently with
+another `az` process can briefly show inconsistent statuses.
+
 The importer uses MSAL's cache lock and checks for intervening profile changes,
 but ordinary `az` profile writes do not honor its lock. **Do not run other `az`
 processes concurrently with import, replacement, or removal.** The profile,

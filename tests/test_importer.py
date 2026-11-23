@@ -69,6 +69,167 @@ class TokenLoginTests(unittest.TestCase):
     def cache(self):
         return load_persisted_token_cache(str(self.config_dir / 'msal_token_cache'), False)
 
+    def test_list_empty_config_does_not_create_files(self):
+        self.assertEqual(importer.list_imports(self.cli_ctx), [])
+        self.assertEqual(list(self.config_dir.iterdir()), [])
+        self.config_dir.rmdir()
+        self.assertEqual(importer.list_imports(self.cli_ctx), [])
+        self.assertFalse(self.config_dir.exists())
+
+    def test_list_allows_cli_created_empty_insecure_directory(self):
+        self.config_dir.chmod(0o755)
+        self.assertEqual(importer.list_imports(self.cli_ctx), [])
+        (self.config_dir / importer.STATE_FILE).write_text('{"version":1,"entries":{}}')
+        with self.assertRaisesRegex(CLIError, 'mode 0700'):
+            importer.list_imports(self.cli_ctx)
+
+    def test_list_imports_is_metadata_only_and_covers_multiple_subscriptions(self):
+        first = jwt()
+        second = jwt(tenant=SECOND_TENANT)
+        importer.import_access_token(self.cli_ctx, first, SUB)
+        importer.import_access_token(self.cli_ctx, second, OTHER_SUB)
+        before = {path.name: path.read_bytes() for path in self.config_dir.iterdir() if path.is_file()}
+        rows = importer.list_imports(self.cli_ctx)
+        after = {path.name: path.read_bytes() for path in self.config_dir.iterdir() if path.is_file()}
+        self.assertEqual(before, after)
+        self.assertEqual({row['subscriptionId'] for row in rows}, {SUB, OTHER_SUB})
+        self.assertEqual({row['tenantId'] for row in rows}, {TENANT, SECOND_TENANT})
+        self.assertEqual({row['tokenStatus'] for row in rows}, {'valid'})
+        self.assertEqual({row['profileStatus'] for row in rows}, {'associated'})
+        self.assertEqual({row['operationStatus'] for row in rows}, {'complete'})
+        self.assertTrue(all(row['expiresOn'].endswith('Z') for row in rows))
+        self.assertNotIn(first, json.dumps(rows))
+        self.assertNotIn(second, json.dumps(rows))
+        self.assertNotIn('token_sha256', json.dumps(rows))
+
+    def test_list_includes_imports_from_other_clouds(self):
+        importer.import_access_token(self.cli_ctx, jwt(), SUB)
+        other_cloud = SimpleNamespace(cloud=SimpleNamespace(
+            name='AzureUSGovernment', endpoints=self.cli_ctx.cloud.endpoints), config=Config())
+        importer.import_access_token(other_cloud, jwt(tenant=SECOND_TENANT), OTHER_SUB)
+        rows = importer.list_imports(self.cli_ctx)
+        self.assertEqual({row['cloud'] for row in rows}, {'AzureCloud', 'AzureUSGovernment'})
+        self.assertEqual({row['subscriptionId'] for row in rows}, {SUB, OTHER_SUB})
+
+    def test_list_distinguishes_expiring_and_expired(self):
+        now = int(time.time())
+        importer.import_access_token(self.cli_ctx, jwt(expires=now + 3600), SUB)
+        with mock.patch.object(importer.time, 'time', return_value=now + 3299):
+            self.assertEqual(importer.list_imports(self.cli_ctx)[0]['tokenStatus'], 'valid')
+        with mock.patch.object(importer.time, 'time', return_value=now + 3300):
+            self.assertEqual(importer.list_imports(self.cli_ctx)[0]['tokenStatus'], 'expiring')
+        with mock.patch.object(importer.time, 'time', return_value=now + 3600):
+            self.assertEqual(importer.list_imports(self.cli_ctx)[0]['tokenStatus'], 'expired')
+
+    def test_list_reads_expired_legacy_token_without_cache_search(self):
+        now = int(time.time())
+        importer.import_access_token(self.cli_ctx, jwt(expires=now + 3600), SUB)
+        state = importer._state(self.config_dir)
+        del state['entries'][SUB]['expires_on']
+        importer._save_json(self.config_dir / importer.STATE_FILE, state)
+        with mock.patch.object(importer.time, 'time', return_value=now + 3600):
+            row, = importer.list_imports(self.cli_ctx)
+        self.assertEqual(row['tokenStatus'], 'expired')
+        self.assertIsNotNone(row['expiresOn'])
+
+    def test_list_reports_missing_and_changed_tokens_without_revealing_them(self):
+        original = jwt()
+        importer.import_access_token(self.cli_ctx, original, SUB)
+        cache = self.cache()
+        token = next(iter(cache.search('AccessToken')))
+        replacement = jwt(oid=OTHER_SUB)
+        cache.modify(cache.CredentialType.ACCESS_TOKEN, token, {'secret': replacement})
+        changed, = importer.list_imports(self.cli_ctx)
+        self.assertEqual(changed['tokenStatus'], 'changed')
+        self.assertNotIn(original, json.dumps(changed))
+        self.assertNotIn(replacement, json.dumps(changed))
+        cache.remove_at(next(iter(cache.search('AccessToken'))))
+        missing, = importer.list_imports(self.cli_ctx)
+        self.assertEqual(missing['tokenStatus'], 'missing')
+        self.assertIsNotNone(missing['expiresOn'])
+
+    def test_list_handles_profile_changes_and_pending_state(self):
+        importer.import_access_token(self.cli_ctx, jwt(), SUB)
+        profile = self.profile()
+        profile['subscriptions'][0]['name'] = 'Updated name'
+        importer._save_json(self.config_dir / importer.PROFILE_FILE, profile)
+        associated, = importer.list_imports(self.cli_ctx)
+        self.assertEqual(associated['name'], 'Updated name')
+        self.assertTrue(associated['isDefault'])
+        profile['subscriptions'][0]['user']['name'] = 'another@example.invalid'
+        importer._save_json(self.config_dir / importer.PROFILE_FILE, profile)
+        changed, = importer.list_imports(self.cli_ctx)
+        self.assertEqual(changed['profileStatus'], 'changed')
+        self.assertIsNone(changed['isDefault'])
+        state = importer._state(self.config_dir)
+        state['entries'][SUB]['pending'] = True
+        importer._save_json(self.config_dir / importer.STATE_FILE, state)
+        self.assertEqual(importer.list_imports(self.cli_ctx)[0]['operationStatus'], 'pending')
+        state['entries'][SUB]['removing'] = True
+        importer._save_json(self.config_dir / importer.STATE_FILE, state)
+        self.assertEqual(importer.list_imports(self.cli_ctx)[0]['operationStatus'], 'removing')
+        importer._save_json(self.config_dir / importer.PROFILE_FILE, {'subscriptions': []})
+        self.assertEqual(importer.list_imports(self.cli_ctx)[0]['profileStatus'], 'missing')
+
+    def test_list_uses_earlier_cache_expiry(self):
+        now = int(time.time())
+        importer.import_access_token(self.cli_ctx, jwt(expires=now + 3600), SUB)
+        cache = self.cache()
+        token = next(iter(cache.search('AccessToken')))
+        cache.modify(cache.CredentialType.ACCESS_TOKEN, token,
+                     {'expires_on': str(now - 1)})
+        with mock.patch.object(importer.time, 'time', return_value=now):
+            row, = importer.list_imports(self.cli_ctx)
+        self.assertEqual(row['tokenStatus'], 'expired')
+        self.assertEqual(row['accountStatus'], 'present')
+
+    def test_list_reports_missing_msal_account(self):
+        importer.import_access_token(self.cli_ctx, jwt(), SUB)
+        cache = self.cache()
+        account = next(iter(cache.search('Account')))
+        cache.modify(cache.CredentialType.ACCOUNT, account,
+                     {'username': 'different@example.invalid'})
+        self.assertEqual(importer.list_imports(self.cli_ctx)[0]['accountStatus'], 'changed')
+        cache.remove_account(next(iter(cache.search('Account'))))
+        row, = importer.list_imports(self.cli_ctx)
+        self.assertEqual(row['tokenStatus'], 'valid')
+        self.assertEqual(row['accountStatus'], 'missing')
+        self.assertEqual(row['profileStatus'], 'associated')
+
+    def test_list_does_not_recreate_missing_cache_file(self):
+        importer.import_access_token(self.cli_ctx, jwt(), SUB)
+        cache_file = self.config_dir / 'msal_token_cache.json'
+        cache_file.unlink()
+        row, = importer.list_imports(self.cli_ctx)
+        self.assertEqual(row['tokenStatus'], 'missing')
+        self.assertFalse(cache_file.exists())
+
+    def test_list_rejects_insecure_cache_permissions(self):
+        importer.import_access_token(self.cli_ctx, jwt(), SUB)
+        cache_file = self.config_dir / 'msal_token_cache.json'
+        cache_file.chmod(0o644)
+        with self.assertRaisesRegex(CLIError, 'owner-only'):
+            importer.list_imports(self.cli_ctx)
+
+    def test_list_handles_legacy_unknown_expiry_and_bad_cache(self):
+        importer.import_access_token(self.cli_ctx, jwt(), SUB)
+        state = importer._state(self.config_dir)
+        del state['entries'][SUB]['expires_on']
+        importer._save_json(self.config_dir / importer.STATE_FILE, state)
+        cache = self.cache()
+        token = next(iter(cache.search('AccessToken')))
+        cache.modify(cache.CredentialType.ACCESS_TOKEN, token, {'expires_on': 'invalid'})
+        row, = importer.list_imports(self.cli_ctx)
+        self.assertEqual(row['tokenStatus'], 'unknown')
+        self.assertIsNone(row['expiresOn'])
+        cache_file = self.config_dir / 'msal_token_cache.json'
+        cache_file.write_text('[]')
+        with self.assertRaisesRegex(CLIError, 'Could not read MSAL token cache'):
+            importer.list_imports(self.cli_ctx)
+        cache_file.write_text('{not-json')
+        with self.assertRaisesRegex(CLIError, 'Could not read MSAL token cache'):
+            importer.list_imports(self.cli_ctx)
+
     def test_import_and_remove_preserve_unrelated_default(self):
         unrelated = {'id': OTHER_SUB, 'name': 'Unrelated', 'tenantId': TENANT,
                      'environmentName': 'AzureCloud', 'state': 'Enabled', 'isDefault': True,
